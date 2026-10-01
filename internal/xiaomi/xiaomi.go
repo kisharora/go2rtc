@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/app"
@@ -48,6 +49,26 @@ func Init() {
 	})
 
 	api.HandleFunc("api/xiaomi", apiXiaomi)
+	api.HandleFunc("api/xiaomi/ctl", apiXiaomiCtl)
+
+	// Learn every camera flip setting ahead of time (and every 6 h), so the
+	// first move is one command, not a lookup plus a command.
+	go func() {
+		time.Sleep(5 * time.Second)
+		for {
+			for _, sources := range streams.GetAllSources() {
+				for _, raw := range sources {
+					if !strings.HasPrefix(raw, "xiaomi://") {
+						continue
+					}
+					if u, err := url.Parse(raw); err == nil {
+						refreshFlip(u.User, u.Query().Get("did"))
+					}
+				}
+			}
+			time.Sleep(6 * time.Hour)
+		}
+	}()
 }
 
 var log zerolog.Logger
@@ -167,7 +188,9 @@ func getMissURL(url *url.URL) (string, error) {
 		clientPublic, query.Get("did"),
 	)
 
+	t0 := time.Now()
 	res, err := cloudUserRequest(url.User, "/v2/device/miss_get_vendor", params)
+	log.Info().Msgf("[xiaomi] vendor did=%s in %dms err=%v", query.Get("did"), time.Since(t0).Milliseconds(), err)
 	if err != nil {
 		if strings.Contains(err.Error(), "no available vendor support") {
 			return getLegacyURL(url)
@@ -206,8 +229,19 @@ func getMissURL(url *url.URL) (string, error) {
 	// runs the cloud handshake.
 	if v.Vendor.ID == 4 && v.Vendor.Params.UID != "" {
 		query.Set("p2p_id", v.Vendor.Params.UID)
-		log.Debug().Msgf("xiaomi: cs2 cloud-relay mode, redirecting to %s", cs2CloudRelayHost)
-		url.Host = cs2CloudRelayHost
+		if relay := query.Get("relay"); relay != "" {
+			// relay=A,B,C: dial A; the miss client falls back to B, then C.
+			relays := strings.Split(relay, ",")
+			relay = relays[0]
+			if len(relays) > 1 {
+				query.Set("relay_alt", strings.Join(relays[1:], ","))
+			}
+			log.Debug().Msgf("xiaomi: cs2 cloud-relay override to %s", relay)
+			url.Host = relay
+		} else {
+			log.Debug().Msgf("xiaomi: cs2 cloud-relay mode, redirecting to %s", cs2CloudRelayHost)
+			url.Host = cs2CloudRelayHost
+		}
 	}
 
 	url.RawQuery = query.Encode()
@@ -376,4 +410,143 @@ func GetBaseURL(region string) string {
 		return "https://" + region + ".api.io.mi.com/app"
 	}
 	return "https://api.io.mi.com/app"
+}
+
+type missCtl interface {
+	SetQuality(q string) error
+	Motor(dir string) error
+}
+
+// apiXiaomiCtl changes quality or moves the camera inside the stream's live
+var flipCache sync.Map // did -> flipEntry
+
+type flipEntry struct {
+	on bool
+	at time.Time
+}
+
+// imageFlipped says (from a cache refreshed every 6 h) whether the camera
+// picture is rotated 180 degrees. Unknown means not flipped.
+func imageFlipped(user *url.Userinfo, did string) bool {
+	if v, ok := flipCache.Load(did); ok {
+		return v.(flipEntry).on
+	}
+	return refreshFlip(user, did)
+}
+
+// refreshFlip reads the camera flip setting from the cloud and caches it.
+func refreshFlip(user *url.Userinfo, did string) bool {
+	if v, ok := flipCache.Load(did); ok && time.Since(v.(flipEntry).at) < 5*time.Hour {
+		return v.(flipEntry).on
+	}
+	res, err := cloudUserRequest(user, "/home/rpc/"+did, `{"id":1,"method":"get_prop","params":["flip"]}`)
+	on := err == nil && strings.Contains(string(res), `"on"`)
+	known := on || (err == nil && strings.Contains(string(res), `"off"`))
+	log.Info().Msgf("[xiaomi] flip did=%s: %s err=%v -> %v", did, res, err, on)
+	if known {
+		flipCache.Store(did, flipEntry{on: on, at: time.Now()})
+	} else if v, ok := flipCache.Load(did); ok {
+		// No answer (a sleeping or remote camera answers empty): keep what
+		// it said before, and ask again on the next move.
+		return v.(flipEntry).on
+	}
+	return on
+}
+
+// session: ?src=cam2&quality=hd or ?src=cam2&motor=left.
+func apiXiaomiCtl(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	stream := streams.Get(q.Get("src"))
+	if stream == nil {
+		http.Error(w, "unknown stream", http.StatusNotFound)
+		return
+	}
+	if dir := q.Get("motor"); dir != "" {
+		// Xiaomi set_motor operations for an upright camera: 1 left, 2 right,
+		// 3 up, 4 down (the gate, mounted flipped, needs them swapped).
+		// A camera mounted upside down with image flip on moves the other
+		// way on screen; Xiaomi Home swaps directions then, so do we.
+		flipped := false
+		for _, raw := range stream.SourceURLs() {
+			if u, err := url.Parse(raw); err == nil && strings.HasPrefix(raw, "xiaomi://") {
+				flipped = imageFlipped(u.User, u.Query().Get("did"))
+				break
+			}
+		}
+		if flipped {
+			dir = map[string]string{"left": "right", "right": "left", "up": "down", "down": "up"}[dir]
+		}
+		op := map[string]int{"left": 1, "right": 2, "up": 3, "down": 4}[dir]
+		if op == 0 {
+			http.Error(w, "motor: left, right, up or down", http.StatusBadRequest)
+			return
+		}
+		// via=p2p: the step over the open camera session (~20 ms). Not the
+		// default: cameras answered "ok" and did not move. The cloud below
+		// moves every model.
+		if q.Get("via") == "p2p" {
+			src := strings.TrimSuffix(q.Get("src"), "_sd")
+			for _, name := range []string{src, src + "_sd"} {
+				s := streams.Get(name)
+				if s == nil {
+					continue
+				}
+				for _, c := range s.LiveConns() {
+					if m, ok := c.(missCtl); ok {
+						t0 := time.Now()
+						err := m.Motor(dir)
+						log.Info().Msgf("[xiaomi] motor p2p %s %s in %dms err=%v", name, dir, time.Since(t0).Milliseconds(), err)
+						if err == nil {
+							_, _ = w.Write([]byte("ok"))
+							return
+						}
+					}
+				}
+			}
+		}
+		for _, raw := range stream.SourceURLs() {
+			if !strings.HasPrefix(raw, "xiaomi://") {
+				continue
+			}
+			u, err := url.Parse(raw)
+			if err != nil {
+				continue
+			}
+			did := u.Query().Get("did")
+			params := fmt.Sprintf(`{"id":1,"method":"set_motor","params":{"operation":%d}}`, op)
+			t0 := time.Now()
+			res, err := cloudUserRequest(u.User, "/home/rpc/"+did, params)
+			log.Info().Msgf("[xiaomi] motor did=%s %s in %dms: %s err=%v", did, dir, time.Since(t0).Milliseconds(), res, err)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write(res)
+			return
+		}
+		http.Error(w, "no xiaomi source", http.StatusNotFound)
+		return
+	}
+	for _, c := range stream.LiveConns() {
+		m, ok := c.(missCtl)
+		if !ok {
+			continue
+		}
+		var err error
+		if v := q.Get("quality"); v != "" {
+			err = m.SetQuality(v)
+		} else if v := q.Get("motor"); v != "" {
+			err = m.Motor(v)
+		} else {
+			http.Error(w, "quality or motor required", http.StatusBadRequest)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+	http.Error(w, "no live session", http.StatusConflict)
 }

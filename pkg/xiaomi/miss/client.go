@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -52,6 +53,7 @@ func NewClient(rawURL string) (*Client, error) {
 	model := query.Get("model")
 
 	// 2. Check if this vendor supported.
+	dialStart := time.Now()
 	var conn Conn
 	switch s := query.Get("vendor"); s {
 	case "cs2":
@@ -59,7 +61,16 @@ func NewClient(rawURL string) (*Client, error) {
 		// Mi-Cloud relay (typical for MJA1-secure-element cameras such
 		// as the c302n). Otherwise fall back to the direct LAN handshake.
 		if p2pID := query.Get("p2p_id"); p2pID != "" {
-			conn, err = cs2.DialCloud(p2pID, u.Host)
+			// One connection attempt, relays in turn (never in parallel).
+			hosts := []string{u.Host}
+			if alt := query.Get("relay_alt"); alt != "" {
+				hosts = append(hosts, strings.Split(alt, ",")...)
+			}
+			for _, host := range hosts {
+				if conn, err = cs2.DialCloud(p2pID, host); err == nil {
+					break
+				}
+			}
 		} else {
 			conn, err = cs2.Dial(u.Host, query.Get("transport"))
 		}
@@ -73,19 +84,23 @@ func NewClient(rawURL string) (*Client, error) {
 		return nil, err
 	}
 
+	dialMs := time.Since(dialStart).Milliseconds()
 	err = login(conn, query.Get("client_public"), query.Get("sign"))
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 
-	return &Client{Conn: conn, key: key, model: model}, nil
+	return &Client{Conn: conn, key: key, model: model,
+		DialMs: dialMs, LoginMs: time.Since(dialStart).Milliseconds() - dialMs}, nil
 }
 
 type Client struct {
 	Conn
 	key   []byte
 	model string
+	// Connect timing for the session log: transport (cs2/tutk) and login.
+	DialMs, LoginMs int64
 }
 
 const (
@@ -112,6 +127,14 @@ const (
 )
 
 func login(conn Conn, clientPublic, sign string) error {
+	// cloudHandshake clears its socket deadline. Without an auth deadline,
+	// ReadCommand can wait forever while the stream's reconnect mutex is held,
+	// preventing every subsequent viewer from opening that camera.
+	if err := conn.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		return fmt.Errorf("miss: auth deadline: %w", err)
+	}
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
+
 	s := fmt.Sprintf(`{"public_key":"%s","sign":"%s","uuid":"","support_encrypt":0}`, clientPublic, sign)
 	if err := conn.WriteCommand(cmdAuthReq, []byte(s)); err != nil {
 		return err
@@ -197,6 +220,20 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
 	default:
 		data = fmt.Appendf(data, `{"videoquality":-1,"videoquality2":%s,"enableaudio":%s}`, quality, audio)
 	}
+	if err := c.WriteCommand(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Motor sends one pan/tilt step, as Xiaomi Home does over the P2P session.
+func (c *Client) Motor(dir string) error {
+	op := map[string]int{"left": 1, "right": 2, "up": 3, "down": 4}[dir]
+	if op == 0 {
+		return fmt.Errorf("miss: motor: unknown direction %q", dir)
+	}
+	data := binary.BigEndian.AppendUint32(nil, cmdMotorReq)
+	data = fmt.Appendf(data, `{"op":%d}`, op)
 	return c.WriteCommand(data)
 }
 

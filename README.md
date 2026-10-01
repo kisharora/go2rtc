@@ -1,3 +1,81 @@
+# go2rtc + Xiaomi Home cameras — anywhere, as RTSP/WebRTC
+
+> **A [go2rtc](https://github.com/AlexxIT/go2rtc) fork that streams every camera on a
+> Xiaomi Home / Mi Home account over Xiaomi's P2P cloud — including cameras behind
+> CGNAT, symmetric NAT, or on another site entirely. No port forwarding, no VPN, no
+> static IP. Sign in with your own Xiaomi account; the cameras become normal go2rtc
+> streams you can watch, record, and feed to Home Assistant, Frigate, Blue Iris,
+> Scrypted, or anything that speaks RTSP/WebRTC/HLS.**
+
+Xiaomi's own app only shows your cameras on your phone. This fork reverse-engineers
+the same `cs2` cloud-relay protocol the Xiaomi Home app uses and exposes it through
+go2rtc, so your Xiaomi cameras behave like any other IP camera — locally **and**
+remotely.
+
+## What this fork adds
+
+- **Remote cameras over Xiaomi's P2P cloud (`cs2`).** The same path the Xiaomi Home
+  app uses: Xiaomi's directory relays (UDP `:32100`) and relay-media pool (`:25000`),
+  then a direct NAT-punched link to the camera with the relay as fallback. Works when
+  the camera is on your LAN, behind your router, or at a different building on
+  someone else's network. Adds the India (`i2`) region on top of upstream.
+- **Full-resolution native video + audio.** HEVC/H265 video and PCMA audio straight
+  from the camera — no HLS transcoding, no resolution loss, low latency.
+- **PTZ / motor control.** Pan and tilt the camera (left/right/up/down) over the P2P
+  session, exactly as the Xiaomi Home app does.
+- **Two-way audio (talk-back).** Listen to the camera's microphone **and** push audio
+  to its speaker — backchannel supported, so you can talk through the camera.
+- **HD and 360p of one camera as separate streams** (`subtype=hd|sd`), plus
+  `subtype=upgrade` (360p first, then HD in the same session) for a fast first
+  picture.
+- **Fast connects.** A concurrent direct NAT punch with port prediction (sweeping the
+  camera's port ±3 every 250 ms, as Xiaomi Home does) races the relay fallback;
+  warm reconnects land in well under a second, and failing fallbacks give up in
+  seconds so a fresh attempt starts quickly.
+- **Keyframe cache.** A viewer joining an already-running stream starts instantly
+  instead of waiting for the camera's next keyframe.
+- **Diagnostics.** Per-session connect timing (transport, login, media start, first
+  packet, first keyframe) and periodic video-channel receive stats (in-order,
+  duplicates, out-of-order, buffer-full, acks, packets per source address).
+
+## How it works
+
+Sign in with any Xiaomi Home account (WebUI → **Add → Xiaomi** → username, password,
+then the email/SMS code or captcha if Xiaomi asks). The cameras on the account become
+go2rtc sources. Each connection obtains fresh encryption keys from Xiaomi's cloud and
+opens a `cs2` session — direct-punched when possible, relayed when not.
+
+Protocol notes: [`XIAOMI_CS2_RELAY.md`](XIAOMI_CS2_RELAY.md) ·
+Xiaomi source config: [`internal/xiaomi/README.md`](internal/xiaomi/README.md).
+
+## Use it with
+
+RTSP/WebRTC/HLS out of go2rtc means these cameras drop straight into
+**Home Assistant** (via the go2rtc add-on / WebRTC integration), **Frigate**,
+**Blue Iris**, **Scrypted**, **Synology Surveillance Station**, **VLC**, **ffmpeg**,
+or any NVR that ingests RTSP.
+
+## Keywords
+
+`xiaomi camera rtsp` · `mi home camera stream` · `xiaomi home camera remote` ·
+`xiaomi camera cloud relay` · `xiaomi p2p cs2` · `xiaomi camera home assistant` ·
+`xiaomi camera frigate` · `xiaomi camera webrtc` · `xiaomi camera ptz` ·
+`xiaomi camera two-way audio` · `xiaomi camera talk back` · `xiaomi camera hevc` ·
+`go2rtc xiaomi` · `reverse engineered xiaomi home` · `xiaomi camera without app` ·
+`xiaomi camera behind cgnat` · `chuangmi camera` · `isa camera` · `miss protocol`
+
+## Credits
+
+- [go2rtc](https://github.com/AlexxIT/go2rtc) by Alexey Khit (MIT) — the base project,
+  the Xiaomi `miss` protocol, and the `cs2`/`tutk` transports.
+- glissmam, go2rtc PR #2264 — the original cs2 cloud-relay handshake this builds on.
+
+All protocol work was done on our own cameras, account, and network for
+interoperability with hardware we own. No credentials, keys, or tokens are in this
+repository — each user signs in with their own account.
+
+---
+
 <h1 align="center">
   <a href="https://github.com/AlexxIT/go2rtc">
     <img src="./website/images/logo.gif" alt="go2rtc - GitHub">

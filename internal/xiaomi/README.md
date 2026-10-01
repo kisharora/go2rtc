@@ -62,3 +62,11 @@ You can use a second channel for dual cameras: `channel=2`.
 streams:
   xiaomi1: xiaomi://***&channel=2
 ```
+
+## Cloud Relay & Relay-Media (cs2)
+
+For cameras that sit behind strict symmetric NATs or firewalls where direct LAN or WAN hole-punching is not possible, this build supports Xiaomi's cloud relay and relay-media handoff protocol (`vendor=cs2`).
+
+When a camera cannot be reached directly, go2rtc coordinates with Xiaomi's directory relays (`:32100`) and relay-media servers (`:25000`) using dynamic session reservation, `0x80`/`0x83` punch-hole handshakes, and device-authenticated `0xF9` routing. This delivers native full-resolution HEVC video and audio with sub-second latency without HLS transcoding.
+
+See [`XIAOMI_CS2_RELAY.md`](../../XIAOMI_CS2_RELAY.md) for full technical and wire-protocol documentation.

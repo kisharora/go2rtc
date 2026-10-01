@@ -47,6 +47,13 @@ func (n *Node) AppendChild(child *Node) {
 	child.parent = n
 }
 
+// Childs returns a copy of the node's children.
+func (n *Node) Childs() []*Node {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]*Node(nil), n.childs...)
+}
+
 func (n *Node) RemoveChild(child *Node) {
 	n.mu.Lock()
 	for i, ch := range n.childs {

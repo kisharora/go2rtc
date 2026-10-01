@@ -128,3 +128,29 @@ func (s *Stream) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(info)
 }
+
+// LiveConns returns the running producer connections of this stream.
+func (s *Stream) LiveConns() []core.Producer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []core.Producer
+	for _, p := range s.producers {
+		p.mu.Lock()
+		if p.conn != nil {
+			out = append(out, p.conn)
+		}
+		p.mu.Unlock()
+	}
+	return out
+}
+
+// SourceURLs returns the configured source URLs of this stream.
+func (s *Stream) SourceURLs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, p := range s.producers {
+		out = append(out, p.url)
+	}
+	return out
+}
