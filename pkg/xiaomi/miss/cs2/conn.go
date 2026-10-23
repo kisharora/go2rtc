@@ -132,11 +132,15 @@ func encryptP2P(plain []byte) []byte {
 // buildP2PIDBlock encodes a p2p_id string of the form "PREFIX-NUM-SUFFIX"
 // into the 20-byte canonical block used by 0x20 (connect) and 0x41 (punch):
 //
-//	[ 0.. 5] prefix (6 bytes, null-padded)  e.g. "ABCDEF"
-//	[ 6.. 7] padding 0x00 0x00
-//	[ 8..11] num (uint32 big-endian)        e.g. 123456 -> 0x0001E240
-//	[12..16] suffix (5 bytes, null-padded)  e.g. "GHIJK"
+//	[ 0.. 7] prefix (up to 8 bytes, null-padded) e.g. "ABCDEF" or "XMSYCNX"
+//	[ 8..11] num (uint32 big-endian)             e.g. 123456 -> 0x0001E240
+//	[12..16] suffix (5 bytes, null-padded)       e.g. "GHIJK"
 //	[17..19] padding 0x00 0x00 0x00
+//
+// China-region cameras use 7-character prefixes (e.g. "XMSYCNX-664931-PEPMU"),
+// India-region cameras use 6 (e.g. "XMSYIN-..."). For a 6-byte prefix the
+// encoding is byte-identical to the original 6+2-pad layout; longer prefixes
+// borrow the former pad bytes, keeping num/suffix offsets fixed.
 func buildP2PIDBlock(p2pID string) ([]byte, error) {
 	parts := strings.Split(p2pID, "-")
 	if len(parts) != 3 {
@@ -146,7 +150,7 @@ func buildP2PIDBlock(p2pID string) ([]byte, error) {
 	numStr := parts[1]
 	suffix := parts[2]
 
-	if len(prefix) > 6 {
+	if len(prefix) > 8 {
 		return nil, fmt.Errorf("cs2 cloud: p2p_id prefix too long: %s", prefix)
 	}
 	if len(suffix) > 5 {
@@ -159,7 +163,7 @@ func buildP2PIDBlock(p2pID string) ([]byte, error) {
 	}
 
 	block := make([]byte, 20)
-	copy(block[0:6], []byte(prefix))
+	copy(block[0:8], []byte(prefix))
 	binary.BigEndian.PutUint32(block[8:12], uint32(num))
 	copy(block[12:17], []byte(suffix))
 	return block, nil
@@ -1030,6 +1034,10 @@ type Conn struct {
 	cmdAck    atomic.Pointer[commandAck]
 	closeOnce sync.Once
 	closeErr  error
+
+	punchMu    sync.Mutex
+	lastPunch  time.Time
+	readyBlock []byte
 }
 
 type handoffTok struct {
@@ -1259,7 +1267,23 @@ func (c *Conn) worker() {
 			c.err = io.EOF
 			_ = c.close(false)
 			return
-		case msgPong, msgP2PRdyUDP, msgP2PRdyTCP, msgCloseAck, msgMediaPunch, msgMediaPunchAck, msgMediaProbeAck, msgMediaHandoff, 0x81, 0x69: // skip it
+		case msgP2PRdyUDP, msgP2PRdyTCP:
+			// Xiaovv-family cameras (e.g. the Dingling N1, xiaovv.camera.fjcam6)
+			// announce session readiness by repeating 0x42/0x43 frames that
+			// carry their 20-byte p2p_id block (0x43 also embeds their
+			// sockaddr, family/port/IP little-endian) and keep doing so until
+			// the client answers with a 0x41 punch carrying the same block.
+			// Without that block punch the camera never starts its media
+			// engine, even though auth and transport ACKs all succeed.
+			c.cacheReadyBlock(buf[:n])
+			c.answerReadyPunch(buf[:n])
+		case msgPunchPkt:
+			// The camera also punches us with its p2p_id block. Per the
+			// cloud-relay handshake pattern, answer with our own block punch
+			// plus an empty 0x42 (UDP-ready) so the camera considers the
+			// path established and starts streaming.
+			c.answerCamPunch(buf[:n])
+		case msgPong, msgCloseAck, msgMediaPunch, msgMediaPunchAck, msgMediaProbeAck, msgMediaHandoff, 0x81, 0x69: // skip it
 		case msgDrwAck: // only for UDP
 			c.acknowledgeCommand(buf[:n])
 		default:
@@ -1302,6 +1326,74 @@ func (c *Conn) Error() error {
 		return c.err
 	}
 	return io.EOF
+}
+
+// cacheReadyBlock stores the camera's 20-byte p2p_id block from its
+// readiness frames for later punches.
+func (c *Conn) cacheReadyBlock(frame []byte) {
+	if len(frame) < 24 || frame[2] != 0x00 || frame[3] != 0x14 {
+		return
+	}
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	c.readyBlock = append(c.readyBlock[:0], frame[4:24]...)
+}
+
+// answerCamPunch replies to a camera punch with our block punch plus an
+// empty 0x42 UDP-ready frame, mirroring the cloud handshake behaviour.
+func (c *Conn) answerCamPunch(frame []byte) {
+	u, ok := c.Conn.(*udpConn)
+	if !ok || u.lastSrc == nil || len(frame) < 8 {
+		return
+	}
+	now := time.Now()
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	if now.Before(c.lastPunch.Add(100 * time.Millisecond)) {
+		return
+	}
+	c.lastPunch = now
+	block := c.readyBlock
+	if len(block) != 20 {
+		// fall back to whatever block bytes the punch carried
+		block = frame[4:]
+		if len(block) > 20 {
+			block = block[:20]
+		}
+	}
+	if len(block) == 0 {
+		return
+	}
+	punch := make([]byte, 0, 24)
+	punch = append(punch, magic, msgPunchPkt, 0x00, byte(len(block)>>8), byte(len(block)))
+	punch = append(punch, block...)
+	_, _ = u.WriteToUDP(punch, u.lastSrc)
+	_, _ = u.WriteToUDP([]byte{magic, msgP2PRdyUDP, 0x00, 0x00}, u.lastSrc)
+}
+
+// answerReadyPunch sends the block-carrying 0x41 punch the camera asks
+// for with its repeated 0x42/0x43 readiness frames. Rate-limited to one
+// punch per frame with a floor interval, since the camera retries fast.
+func (c *Conn) answerReadyPunch(frame []byte) {
+	// frame: f1 42|43 00 14 <20-byte p2p_id block> [...]
+	if len(frame) < 24 || frame[2] != 0x00 || frame[3] != 0x14 {
+		return
+	}
+	u, ok := c.Conn.(*udpConn)
+	if !ok || u.lastSrc == nil {
+		return
+	}
+	now := time.Now()
+	c.punchMu.Lock()
+	defer c.punchMu.Unlock()
+	if now.Before(c.lastPunch.Add(100 * time.Millisecond)) {
+		return
+	}
+	c.lastPunch = now
+	punch := make([]byte, 0, 24)
+	punch = append(punch, magic, msgPunchPkt, 0x00, 0x14)
+	punch = append(punch, frame[4:24]...)
+	_, _ = u.WriteToUDP(punch, u.lastSrc)
 }
 
 func (c *Conn) ReadCommand() (cmd uint32, data []byte, err error) {
@@ -1490,6 +1582,11 @@ type udpConn struct {
 	// Data packets per source address since the last stats line.
 	srcMu sync.Mutex
 	srcs  map[string]int
+
+	// Source address of the most recent datagram, used by the
+	// block-punch responder for the Xiaovv readiness frames.
+	srcMu2  sync.Mutex
+	lastSrc *net.UDPAddr
 }
 
 // takeSources returns "addr=count ..." for the packets read since the last
@@ -1524,6 +1621,10 @@ func (c *udpConn) Read(b []byte) (n int, err error) {
 			c.srcs[key]++
 			c.srcMu.Unlock()
 		}
+
+		c.srcMu2.Lock()
+		c.lastSrc = addr
+		c.srcMu2.Unlock()
 
 		if string(addr.IP) == string(c.addr.IP) || n >= 8 {
 			//log.Printf("<- %x", b[:n])
