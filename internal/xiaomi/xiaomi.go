@@ -191,6 +191,8 @@ func getMissURL(url *url.URL) (string, error) {
 	t0 := time.Now()
 	res, err := cloudUserRequest(url.User, "/v2/device/miss_get_vendor", params)
 	log.Info().Msgf("[xiaomi] vendor did=%s in %dms err=%v", query.Get("did"), time.Since(t0).Milliseconds(), err)
+	log.Debug().Msgf("[xiaomi] vendor raw response: %s", res)
+
 	if err != nil {
 		if strings.Contains(err.Error(), "no available vendor support") {
 			return getLegacyURL(url)
@@ -227,7 +229,9 @@ func getMissURL(url *url.URL) (string, error) {
 	// only stream via the Mi-Cloud relay. Pass the p2p_id through and
 	// redirect the host to the relay; the miss client picks this up and
 	// runs the cloud handshake.
-	if v.Vendor.ID == 4 && v.Vendor.Params.UID != "" {
+	// Opt-out with relay=lan to force the direct LAN handshake even when
+	// the cloud reports a relay p2p_id.
+	if v.Vendor.ID == 4 && v.Vendor.Params.UID != "" && query.Get("relay") != "lan" {
 		query.Set("p2p_id", v.Vendor.Params.UID)
 		if relay := query.Get("relay"); relay != "" {
 			// relay=A,B,C: dial A; the miss client falls back to B, then C.

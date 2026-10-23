@@ -169,6 +169,9 @@ const (
 	ModelLoockV2 = "loock.cateye.v02"
 	ModelC200    = "chuangmi.camera.046c04"
 	ModelC300    = "chuangmi.camera.72ac1"
+	// ModelDinglingN1 ignores videoquality 2 entirely — it only starts the
+	// media engine at quality 3 (2304x1296 HEVC). Same behaviour as C200/C300.
+	ModelDinglingN1 = "xiaovv.camera.fjcam6"
 	// ModelXiaofang looks like it has the same firmware as the ModelDafang.
 	// There is also an older model "isa.camera.isc5" that only works with the legacy protocol.
 	ModelXiaofang = "isa.camera.isc5c1"
@@ -198,7 +201,7 @@ func (c *Client) StartMedia(channel, quality, audio string) error {
 		// Some models have low quality in quality 2.
 		// Different models require different default quality settings.
 		switch c.model {
-		case ModelC200, ModelC300:
+		case ModelC200, ModelC300, ModelDinglingN1:
 			quality = "3"
 		default:
 			quality = "2"
